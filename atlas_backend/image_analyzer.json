@@ -1,0 +1,16 @@
+{
+  "analyzerId": "atlas_image_tags",
+  "description": "Generate concise, visually grounded tags for marketing images.",
+  "baseAnalyzerId": "prebuilt-image",
+  "fieldSchema": {
+    "name": "AtlasImageTags",
+    "fields": {
+      "tags": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Up to twelve short, distinct tags describing visible subjects, objects, setting, colors, and actions. Do not infer private traits or information not visible in the image.",
+        "method": "generate"
+      }
+    }
+  }
+}

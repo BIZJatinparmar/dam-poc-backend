@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas
+      POSTGRES_DB: atlas
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    profiles: ["blob-test"]
+    command: azurite-blob --blobHost 0.0.0.0
+    ports:
+      - "127.0.0.1:10000:10000"
+
+volumes:
+  postgres_data:
