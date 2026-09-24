@@ -290,9 +290,26 @@ def retry_analysis(asset_id: str, db: SessionDep, user: UserDep):
         raise HTTPException(403, "Agency users have read-only access")
     if asset.analysis_state != "failed":
         raise HTTPException(409, "Only failed analysis can be retried")
-    asset.analysis_state = "queued"
+    asset.analysis_state = "indexing" if asset.type == "video" and asset.speech_job_url else "queued"
     asset.analysis_progress = None
     asset.analysis_error = None
+    db.commit()
+    db.refresh(asset)
+    return asset
+
+
+@app.post("/api/assets/{asset_id}/tags/retry", response_model=AssetRead)
+def retry_tags(asset_id: str, db: SessionDep, user: UserDep):
+    asset = db.get(Asset, asset_id)
+    if not asset or not visible(asset, user):
+        raise HTTPException(404, "Asset not found")
+    if user.role == "agency":
+        raise HTTPException(403, "Agency users have read-only access")
+    if asset.type != "video" or asset.analysis_state != "complete" or not asset.tag_error or not asset.transcript:
+        raise HTTPException(409, "Video tags are not ready to retry")
+    asset.tag_error = None
+    asset.analysis_state = "preparing"
+    asset.analysis_progress = None
     db.commit()
     db.refresh(asset)
     return asset

@@ -7,6 +7,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from dotenv import load_dotenv
+
+
+load_dotenv()
 
 
 def check_azure_response(response: httpx.Response) -> None:

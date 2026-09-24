@@ -85,14 +85,14 @@ class BlobStorage:
         self.container = container
 
     @classmethod
-    def from_environment(cls) -> "BlobStorage":
+    def from_environment(cls, container_name: str | None = None) -> "BlobStorage":
         connection_string = os.getenv("ATLAS_BLOB_CONNECTION_STRING")
         if connection_string:
             service = BlobServiceClient.from_connection_string(connection_string, api_version="2023-11-03")
         else:
             account_url = os.environ["ATLAS_BLOB_ACCOUNT_URL"]
             service = BlobServiceClient(account_url=account_url, credential=DefaultAzureCredential())
-        return cls(service.get_container_client(os.environ["ATLAS_BLOB_CONTAINER"]))
+        return cls(service.get_container_client(container_name or os.environ["ATLAS_BLOB_CONTAINER"]))
 
     def blob(self, name: str):
         return self.container.get_blob_client(valid_name(name))

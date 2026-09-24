@@ -56,6 +56,7 @@ class AssetRead(BaseModel):
     analysis_state: str | None = None
     analysis_progress: int | None = None
     analysis_error: str | None = None
+    tag_error: str | None = None
 
 
 class TranscriptSegment(BaseModel):

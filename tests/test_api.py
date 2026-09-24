@@ -2,7 +2,6 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from atlas_backend import app as app_module
-from atlas_backend.analysis import AnalysisFailure, AzureAnalysisClient, run_analysis_step
+from atlas_backend.analysis import AnalysisFailure, run_analysis_step
 from atlas_backend.database import Base, get_db
 from atlas_backend.models import Activity, Asset
 from atlas_backend.storage import LocalStorage
@@ -198,20 +197,29 @@ class FakeAzure:
             {"valueString": "Coast"}, {"valueString": "Sky"}, {"valueString": "coast"}
         ]}}}]}}
 
-    def submit_video(self, asset, path):
+    def stage_audio(self, asset, path):
         assert path.is_file() and asset.type == "video"
-        return "azure-video-1"
+        return "video.flac"
 
-    def poll_video(self, video_id):
-        assert video_id == "azure-video-1"
+    def submit_video(self, asset, audio_blob):
+        assert audio_blob == "video.flac"
+        return "https://speech.test/speechtotext/transcriptions/job-1"
+
+    def delete_audio(self, name):
+        assert name == "video.flac"
+
+    def tag_transcript(self, transcript):
+        assert transcript[0]["text"] == "A bright blue ocean"
+        return ["Ocean"]
+
+    def poll_video(self, job_url):
+        assert job_url.endswith("job-1")
         self.poll_count += 1
         if self.poll_count == 1:
-            return "indexing", 43, None
-        return "complete", 100, {"videos": [{"insights": {
-            "labels": [{"name": "Ocean"}],
-            "transcript": [{"id": 1, "text": "A bright blue ocean", "instances": [
-                {"start": "0:00:01", "end": "0:00:03"}]}],
-        }}]}
+            return "indexing", None
+        return "complete", {"recognizedPhrases": [{"recognitionStatus": "Success",
+            "offsetInTicks": 12_340_000, "durationInTicks": 20_000_000,
+            "nBest": [{"display": "A bright blue ocean"}]}]}
 
 
 def test_image_analysis_merges_tags_edited_during_processing(client):
@@ -249,10 +257,12 @@ def test_video_progress_transcript_correction_search_and_permissions(client):
     run_analysis_step(engine, upload_dir, azure)
     in_progress = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
     assert in_progress["analysis_state"] == "indexing"
-    assert in_progress["analysis_progress"] == 43
+    assert in_progress["analysis_progress"] is None
+    run_analysis_step(engine, upload_dir, azure)
     run_analysis_step(engine, upload_dir, azure)
     finished = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
-    assert finished["transcript"] == [{"id": 1, "start": "0:00:01", "end": "0:00:03", "text": "A bright blue ocean"}]
+    assert finished["transcript"] == [{"id": 1, "start": "0:00:01.234", "end": "0:00:03.234", "text": "A bright blue ocean"}]
+    assert finished["ai_tags"] == ["Ocean"]
     corrected = http.patch(f"/api/assets/{asset_id}/transcript/1", headers=as_user("alex"),
                            json={"text": "A calm blue sea"})
     assert corrected.status_code == 200
@@ -261,6 +271,60 @@ def test_video_progress_transcript_correction_search_and_permissions(client):
     assert asset_id not in [item["id"] for item in http.get("/api/assets?q=bright", headers=as_user("alex")).json()]
     assert http.patch(f"/api/assets/{asset_id}/transcript/1", headers=as_user("quinn"),
                       json={"text": "changed"}).status_code == 404
+
+
+def test_tag_failure_keeps_transcript_and_tag_retry_skips_speech(client):
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("clip.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+
+    class FailTags(FakeAzure):
+        def tag_transcript(self, transcript):
+            raise AnalysisFailure("private model error")
+
+    azure = FailTags("video")
+    for _ in range(4):
+        run_analysis_step(engine, upload_dir, azure)
+    detail = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
+    assert detail["analysis_state"] == "complete"
+    assert detail["transcript"][0]["text"] == "A bright blue ocean"
+    assert "Retry tags" in detail["tag_error"]
+    assert "private model error" not in detail["tag_error"]
+    assert http.post(f"/api/assets/{asset_id}/tags/retry", headers=as_user("quinn")).status_code == 404
+    assert http.post(f"/api/assets/{asset_id}/tags/retry", headers=as_user("alex")).json()["analysis_state"] == "preparing"
+
+    class TagsOnly(FakeAzure):
+        def submit_video(self, asset, audio_blob):
+            raise AssertionError("Speech must not be charged again")
+
+        def poll_video(self, job_url):
+            raise AssertionError("Speech must not be polled again")
+
+    run_analysis_step(engine, upload_dir, TagsOnly("video"))
+    detail = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
+    assert detail["tag_error"] is None
+    assert detail["ai_tags"] == ["Ocean"]
+
+
+def test_video_without_audio_completes_without_speech(client):
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("silent.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+
+    class NoAudio(FakeAzure):
+        def stage_audio(self, asset, path):
+            return None
+
+        def submit_video(self, asset, audio_blob):
+            raise AssertionError("No Speech job expected")
+
+    run_analysis_step(engine, upload_dir, NoAudio("video"))
+    detail = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
+    assert detail["analysis_state"] == "complete"
+    assert detail["transcript"] == []
+    assert detail["tag_error"] is None
 
 
 def test_failed_analysis_can_retry_after_configuration(client):
@@ -285,7 +349,47 @@ def test_failed_analysis_can_retry_after_configuration(client):
     assert http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()["analysis_state"] == "complete"
 
 
-def test_video_token_permission_failure_has_actionable_safe_error(client):
+def test_retry_resumes_speech_job_after_temporary_poll_error(client):
+    from atlas_backend.analysis import SpeechJobFailure
+
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("clip.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+    run_analysis_step(engine, upload_dir, FakeAzure("video"))
+
+    class TemporaryPoll(FakeAzure):
+        def poll_video(self, job_url):
+            raise AnalysisFailure("Speech polling was temporarily unavailable")
+
+    run_analysis_step(engine, upload_dir, TemporaryPoll("video"))
+    retried = http.post(f"/api/assets/{asset_id}/analysis/retry", headers=as_user("alex")).json()
+    assert retried["analysis_state"] == "indexing"
+
+    class Resume(FakeAzure):
+        def submit_video(self, asset, audio_blob):
+            raise AssertionError("The existing Speech job must be reused")
+
+        def poll_video(self, job_url):
+            return "complete", {"recognizedPhrases": []}
+
+    run_analysis_step(engine, upload_dir, Resume("video"))
+    assert http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()["analysis_state"] == "preparing"
+
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("other.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    failed_id = created.json()["id"]
+    run_analysis_step(engine, upload_dir, FakeAzure("video"), failed_id)
+
+    class TerminalPoll(FakeAzure):
+        def poll_video(self, job_url):
+            raise SpeechJobFailure("Azure Speech batch transcription failed")
+
+    run_analysis_step(engine, upload_dir, TerminalPoll("video"), failed_id)
+    assert http.post(f"/api/assets/{failed_id}/analysis/retry", headers=as_user("alex")).json()["analysis_state"] == "queued"
+
+
+def test_speech_permission_failure_is_safe(client):
     from atlas_backend import analysis
 
     http, engine, upload_dir = client
@@ -294,10 +398,8 @@ def test_video_token_permission_failure_has_actionable_safe_error(client):
     asset_id = created.json()["id"]
 
     class DeniedAzure(FakeAzure):
-        def submit_video(self, asset, path):
-            request = analysis.httpx.Request(
-                "POST", "https://management.azure.com/subscriptions/test/resourceGroups/test/"
-                "providers/Microsoft.VideoIndexer/accounts/test/generateAccessToken")
+        def submit_video(self, asset, audio_blob):
+            request = analysis.httpx.Request("POST", "https://speech.test/speechtotext/transcriptions:submit")
             response = analysis.httpx.Response(403, request=request, json={"error": {
                 "code": "AuthorizationFailed", "message": "Client private-identifier is not authorized",
             }})
@@ -306,8 +408,33 @@ def test_video_token_permission_failure_has_actionable_safe_error(client):
     run_analysis_step(engine, upload_dir, DeniedAzure("video"))
     asset = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
     assert asset["analysis_state"] == "failed"
-    assert "Video Indexer Account Contributor" in asset["analysis_error"]
+    assert "403" in asset["analysis_error"]
     assert "private-identifier" not in asset["analysis_error"]
+
+
+def test_speech_submit_400_keeps_safe_provider_code(client):
+    from atlas_backend import analysis
+
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("clip.mp4", b"\x00\x00\x00\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+
+    class BadRequestAzure(FakeAzure):
+        def submit_video(self, asset, audio_blob):
+            request = analysis.httpx.Request("POST", "https://speech.test/speechtotext/transcriptions:submit")
+            response = analysis.httpx.Response(400, request=request, json={
+                "code": "InvalidRequest", "innerError": {"code": "InaccessibleCustomerStorage"},
+                "message": "Private URL and token must not be shown",
+            })
+            response.raise_for_status()
+
+    run_analysis_step(engine, upload_dir, BadRequestAzure("video"))
+    asset = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
+    assert asset["analysis_state"] == "failed"
+    assert asset["analysis_error"] == ("Azure Speech submission failed "
+                                       "(400, InvalidRequest: InaccessibleCustomerStorage)")
+    assert "Private URL" not in asset["analysis_error"]
 
 
 def test_new_upload_formats_and_limits(client, monkeypatch):
@@ -329,116 +456,46 @@ def test_resume_existing_video_job_with_no_speech(client):
     with Session(engine) as db:
         asset = db.get(Asset, asset_id)
         asset.analysis_state = "indexing"
-        asset.azure_video_id = "azure-video-1"
+        asset.speech_job_url = "https://speech.test/speechtotext/transcriptions/job-1"
         db.commit()
 
     class SilentAzure(FakeAzure):
-        def poll_video(self, video_id):
-            return "complete", 100, {"videos": [{"insights": {"labels": [], "transcript": []}}]}
+        def poll_video(self, job_url):
+            return "complete", {"recognizedPhrases": []}
 
-        def submit_video(self, asset, path):
+        def submit_video(self, asset, audio_blob):
             raise AssertionError("A resumed job must not upload the video again")
 
+        def tag_transcript(self, transcript):
+            assert transcript == []
+            return []
+
+    run_analysis_step(engine, upload_dir, SilentAzure("video"))
     run_analysis_step(engine, upload_dir, SilentAzure("video"))
     asset = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
     assert asset["analysis_state"] == "complete"
     assert asset["transcript"] == []
 
 
-def test_video_client_polls_index_for_progress_and_result(monkeypatch):
-    from atlas_backend import analysis
-
-    calls = []
-
-    def handler(request):
-        calls.append(str(request.url))
-        assert request.url.path.endswith("/Videos/video/Index")
-        if len(calls) == 1:
-            return analysis.httpx.Response(200, json={"state": "Processing", "processingProgress": "43%"})
-        return analysis.httpx.Response(200, json={"state": "Processed", "videos": []})
-
-    original_client = analysis.httpx.Client
-    transport = analysis.httpx.MockTransport(handler)
-    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original_client(transport=transport, **kwargs))
-    monkeypatch.setattr(AzureAnalysisClient, "_vi_token", lambda self: "fake-token")
-    client = AzureAnalysisClient()
-    client.vi_location = "westus2"
-    client.vi_account_id = "account"
-    assert client.poll_video("video") == ("indexing", 43, None)
-    result, progress, payload = client.poll_video("video")
-    assert (result, progress, payload["state"]) == ("complete", 100, "Processed")
-    assert calls == [
-        "https://api.videoindexer.ai/westus2/Accounts/account/Videos/video/Index?includeSummarizedInsights=false",
-        "https://api.videoindexer.ai/westus2/Accounts/account/Videos/video/Index?includeSummarizedInsights=false",
-    ]
-
-
-def test_av1_video_is_converted_before_upload(tmp_path, monkeypatch):
+def test_audio_extraction_preserves_timeline_and_original(tmp_path, monkeypatch):
     from atlas_backend import analysis
 
     source = tmp_path / "source.mp4"
-    source.write_bytes(b"original-av1-bytes")
+    source.write_bytes(b"original-video-bytes")
+    output = tmp_path / "audio.flac"
     commands = []
 
     def fake_run(command, **kwargs):
-        commands.append(command[0])
+        commands.append(command)
         if command[0] == "ffprobe":
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"streams": [
-                {"codec_type": "video", "codec_name": "av1"},
-                {"codec_type": "audio", "codec_name": "aac"},
+                {"codec_type": "video"}, {"codec_type": "audio"},
             ]}), stderr="")
-        Path(command[-1]).write_bytes(b"converted-h264-bytes")
+        Path(command[-1]).write_bytes(b"extracted-audio")
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    def handler(request):
-        assert b"converted-h264-bytes" in request.content
-        assert b"original-av1-bytes" not in request.content
-        return analysis.httpx.Response(200, json={"id": "converted-video-id"})
-
-    original_client = analysis.httpx.Client
-    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original_client(
-        transport=analysis.httpx.MockTransport(handler), **kwargs))
     monkeypatch.setattr(analysis.subprocess, "run", fake_run)
-    monkeypatch.setattr(AzureAnalysisClient, "_vi_token", lambda self: "fake-token")
-    client = AzureAnalysisClient()
-    client.vi_location = "westus2"
-    client.vi_account_id = "account"
-    asset = SimpleNamespace(id="asset-1", title="AV1 clip")
-    assert client.submit_video(asset, source) == "converted-video-id"
-    assert commands == ["ffprobe", "ffmpeg"]
-    assert sorted(tmp_path.iterdir()) == [source]
-
-
-def test_video_indexer_invalid_format_error_is_actionable(monkeypatch):
-    from atlas_backend import analysis
-
-    def handler(request):
-        return analysis.httpx.Response(200, json={"state": "Failed", "videos": [{
-            "failureCode": "InvalidFileFormat", "failureMessage": "private Azure detail",
-        }]})
-
-    original_client = analysis.httpx.Client
-    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original_client(
-        transport=analysis.httpx.MockTransport(handler), **kwargs))
-    monkeypatch.setattr(AzureAnalysisClient, "_vi_token", lambda self: "fake-token")
-    client = AzureAnalysisClient()
-    client.vi_location = "westus2"
-    client.vi_account_id = "account"
-    with pytest.raises(AnalysisFailure, match="unsupported video format"):
-        client.poll_video("video")
-
-
-def test_video_indexer_conflict_while_indexing_is_not_a_failure(monkeypatch):
-    from atlas_backend import analysis
-
-    def handler(request):
-        return analysis.httpx.Response(409, json={"ErrorType": "GENERAL", "Message": "Video is being indexed"})
-
-    original_client = analysis.httpx.Client
-    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original_client(
-        transport=analysis.httpx.MockTransport(handler), **kwargs))
-    monkeypatch.setattr(AzureAnalysisClient, "_vi_token", lambda self: "fake-token")
-    client = AzureAnalysisClient()
-    client.vi_location = "westus2"
-    client.vi_account_id = "account"
-    assert client.poll_video("video") == ("indexing", None, None)
+    assert analysis.extract_audio(source, output)
+    assert [item[0] for item in commands] == ["ffprobe", "ffmpeg"]
+    assert "aresample=async=1:first_pts=0" in commands[1]
+    assert source.read_bytes() == b"original-video-bytes"
