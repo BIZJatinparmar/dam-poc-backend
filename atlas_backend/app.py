@@ -16,19 +16,25 @@ from tempfile import TemporaryDirectory
 from typing import Annotated
 from uuid import uuid4
 
+from azure.core.exceptions import AzureError
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .analysis import TAG_LOCK, analysis_worker, clean_tags, merge_tags
+from .analysis import TAG_LOCK, analysis_worker, clean_tags
 from .database import engine, get_db
 from .demo_data import USERS, art_svg
-from .models import Activity, Asset, User
-from .schemas import ActivityRead, AssetDetail, AssetRead, AssetUpdate, Summary, TranscriptUpdate, UserCreate, UserRead, UserUpdate
+from .discovery import grounded_answer, mark_search_pending, search_hits, search_worker
+from .media_access import signed_media_url, verify_media_url
+from .models import Activity, Asset, SearchState, User, utc_now
+from .schemas import (ActivityRead, AssetDetail, AssetRead, AssetUpdate, DiscoveryChatRequest,
+                      DiscoveryChatResponse, DiscoverySearchRequest, DiscoveryResult, Summary,
+                      TranscriptUpdate, UserCreate, UserRead, UserUpdate)
 from .storage import create_storage
+from .video_metadata import duration_label, probe_video_duration
 
 
 MAX_IMAGE_BYTES = 12_000_000
@@ -57,6 +63,37 @@ def seed_database(db: Session) -> None:
         db.flush()
     db.execute(delete(Asset).where(Asset.id.in_(STARTER_ASSET_IDS), Asset.file_name.is_(None)))
     db.execute(delete(Activity).where(Activity.text.in_(STARTER_ACTIVITY)))
+    for asset in db.scalars(select(Asset).where(Asset.type == "video", Asset.analysis_state == "complete",
+                                               Asset.video_category.is_(None), Asset.classification_error.is_(None),
+                                               Asset.category_source.is_(None))):
+        if asset.transcript:
+            asset.analysis_state = "preparing"
+    db.commit()
+
+
+def backfill_video_sizes(db: Session) -> None:
+    """Read object metadata for videos uploaded before exact sizes were stored."""
+    for asset in db.scalars(select(Asset).where(Asset.type == "video", Asset.size_bytes.is_(None),
+                                               Asset.file_name.is_not(None))):
+        try:
+            asset.size_bytes = storage.size_bytes(asset.file_name)
+        except (OSError, AzureError):
+            continue
+    db.commit()
+
+
+def backfill_video_durations(db: Session) -> None:
+    """Probe originals uploaded before video duration was recorded."""
+    for asset in db.scalars(select(Asset).where(Asset.type == "video", Asset.duration_seconds.is_(None),
+                                               Asset.file_name.is_not(None))):
+        try:
+            with storage.materialize(asset.file_name) as path:
+                seconds = probe_video_duration(path)
+        except (OSError, AzureError):
+            continue
+        if seconds is not None:
+            asset.duration_seconds = seconds
+            asset.duration = duration_label(seconds)
     db.commit()
 
 
@@ -64,12 +101,17 @@ def seed_database(db: Session) -> None:
 async def lifespan(_app: FastAPI):
     with Session(engine) as db:
         seed_database(db)
+        backfill_video_sizes(db)
+        backfill_video_durations(db)
     worker = asyncio.create_task(analysis_worker(engine, storage)) if ANALYSIS_WORKER_ENABLED else None
+    discovery_worker = asyncio.create_task(search_worker(engine)) if ANALYSIS_WORKER_ENABLED else None
     yield
-    if worker:
-        worker.cancel()
+    for task in (worker, discovery_worker):
+        if not task:
+            continue
+        task.cancel()
         try:
-            await worker
+            await task
         except asyncio.CancelledError:
             pass
 
@@ -108,6 +150,16 @@ def visible(asset: Asset, user: User) -> bool:
         and asset.status in {"approved", "published"}
         and asset.rights >= date.today()
     )
+
+
+def public_asset(asset: Asset, user: User, detail: bool = False) -> AssetRead | AssetDetail:
+    model = AssetDetail if detail else AssetRead
+    data = model.model_validate(asset)
+    if asset.file_name:
+        data.url = signed_media_url(asset, user, "original")
+        if asset.type == "video":
+            data.thumbnail_url = signed_media_url(asset, user, "thumbnail")
+    return data
 
 
 def require_admin(user: User) -> None:
@@ -199,7 +251,66 @@ def list_assets(
     if q.strip():
         assets = [(search_score(item, q), item) for item in assets]
         assets = [item for rank, item in sorted(assets, key=lambda pair: pair[0], reverse=True) if rank]
-    return assets
+    return [public_asset(asset, user) for asset in assets]
+
+
+@app.post("/api/discovery/search", response_model=list[DiscoveryResult])
+def discovery_search(payload: DiscoverySearchRequest, db: SessionDep, user: UserDep):
+    try:
+        hits = search_hits(db, user, payload.query, payload.media_type, payload.status)
+    except Exception:
+        raise HTTPException(503, "Semantic search is temporarily unavailable") from None
+    return [{"asset": public_asset(asset, user), "matches": matches} for asset, matches in hits]
+
+
+@app.post("/api/discovery/chat", response_model=DiscoveryChatResponse)
+def discovery_chat(payload: DiscoveryChatRequest, db: SessionDep, user: UserDep):
+    prior_questions = [item.content for item in payload.history if item.role == "user"][-2:]
+    retrieval_query = " ".join([*prior_questions, payload.message])
+    try:
+        hits = search_hits(db, user, retrieval_query, payload.media_type, payload.status)
+        sources = [{**match, "title": asset.title} for asset, matches in hits for match in matches][:12]
+        answer, citation_ids = grounded_answer(payload.message,
+                                                [item.model_dump() for item in payload.history], sources)
+    except Exception:
+        raise HTTPException(503, "Discovery chat is temporarily unavailable") from None
+    by_id = {match["id"]: (asset, match) for asset, matches in hits for match in matches}
+    return {"answer": answer, "citations": [
+        {"asset": public_asset(by_id[chunk_id][0], user), "match": by_id[chunk_id][1]}
+        for chunk_id in citation_ids if chunk_id in by_id]}
+
+
+@app.get("/api/discovery/index-status")
+def discovery_index_status(db: SessionDep, user: UserDep):
+    states = db.execute(select(SearchState, Asset).join(Asset, Asset.id == SearchState.asset_id)).all()
+    return [{"asset_id": asset.id, "title": asset.title, "status": state.status, "error": state.error}
+            for state, asset in states if visible(asset, user) and state.status != "ready"]
+
+
+@app.post("/api/assets/{asset_id}/search/retry")
+def retry_search_index(asset_id: str, db: SessionDep, user: UserDep):
+    asset = db.get(Asset, asset_id)
+    if not asset or not visible(asset, user):
+        raise HTTPException(404, "Asset not found")
+    if user.role == "agency":
+        raise HTTPException(403, "Agency users have read-only access")
+    state = db.get(SearchState, asset_id)
+    if not state or state.status != "failed":
+        raise HTTPException(409, "Search indexing has not failed")
+    state.status = "pending"
+    state.error = None
+    state.updated_at = utc_now()
+    db.commit()
+    return {"asset_id": asset_id, "status": "pending"}
+
+
+@app.post("/api/discovery/retry-failed")
+def retry_failed_search_indexes(db: SessionDep, user: UserDep):
+    require_admin(user)
+    result = db.execute(update(SearchState).where(SearchState.status == "failed")
+                        .values(status="pending", error=None, updated_at=utc_now()))
+    db.commit()
+    return {"queued": result.rowcount}
 
 
 @app.get("/api/summary", response_model=Summary)
@@ -218,7 +329,7 @@ def get_asset(asset_id: str, db: SessionDep, user: UserDep):
     asset = db.get(Asset, asset_id)
     if not asset or not visible(asset, user):
         raise HTTPException(404, "Asset not found")
-    return asset
+    return public_asset(asset, user, detail=True)
 
 
 @app.patch("/api/assets/{asset_id}", response_model=AssetRead)
@@ -233,6 +344,10 @@ def update_asset(asset_id: str, payload: AssetUpdate, db: SessionDep, user: User
         raise HTTPException(422, "Fields cannot be null")
     if "tags" in updates and ("tag_additions" in updates or "tag_removals" in updates):
         raise HTTPException(422, "Use either tags or tag changes")
+    if ("video_category" in updates or "video_format" in updates) and asset.type != "video":
+        raise HTTPException(422, "Only videos can be classified")
+    if "video_format" in updates and not (updates.get("video_category") or asset.video_category):
+        raise HTTPException(422, "Choose a video topic before setting its format")
     new_status = updates.get("status")
     if new_status:
         if new_status not in TRANSITIONS[asset.status]:
@@ -245,14 +360,25 @@ def update_asset(asset_id: str, payload: AssetUpdate, db: SessionDep, user: User
         db.refresh(asset)
         additions = updates.pop("tag_additions", [])
         removals = {tag.casefold() for tag in updates.pop("tag_removals", [])}
+        next_tags = None
+        if additions or removals:
+            next_tags = clean_tags([tag for tag in asset.tags if tag.casefold() not in removals] + additions,
+                                   limit=21)
+            if len(next_tags) > 20:
+                raise HTTPException(422, "An asset can have up to 20 tags")
         for key, value in updates.items():
             setattr(asset, key, clean_tags(value) if key == "tags" else value)
-        if additions or removals:
-            asset.tags = merge_tags([tag for tag in asset.tags if tag.casefold() not in removals], additions)
+        if "video_category" in updates or "video_format" in updates:
+            asset.category_source = "manual"
+            asset.classification_evidence = None
+            asset.classification_error = None
+        if next_tags is not None:
+            asset.tags = next_tags
+        mark_search_pending(db, asset)
         log_activity(db, f"{asset.title} updated to {asset.status.replace('_', ' ')}", user)
         db.commit()
     db.refresh(asset)
-    return asset
+    return public_asset(asset, user)
 
 
 @app.patch("/api/assets/{asset_id}/transcript/{segment_id}", response_model=AssetDetail)
@@ -275,10 +401,19 @@ def update_transcript(asset_id: str, segment_id: int, payload: TranscriptUpdate,
     else:
         raise HTTPException(404, "Transcript segment not found")
     asset.transcript = segments
+    if asset.category_source != "manual":
+        asset.video_category = None
+        asset.video_format = None
+        asset.classification_evidence = None
+        asset.category_source = None
+    asset.classification_error = None
+    asset.analysis_state = "preparing"
+    asset.analysis_progress = None
+    mark_search_pending(db, asset)
     log_activity(db, f"{asset.title} transcript corrected", user)
     db.commit()
     db.refresh(asset)
-    return asset
+    return public_asset(asset, user, detail=True)
 
 
 @app.post("/api/assets/{asset_id}/analysis/retry", response_model=AssetRead)
@@ -295,7 +430,7 @@ def retry_analysis(asset_id: str, db: SessionDep, user: UserDep):
     asset.analysis_error = None
     db.commit()
     db.refresh(asset)
-    return asset
+    return public_asset(asset, user)
 
 
 @app.post("/api/assets/{asset_id}/tags/retry", response_model=AssetRead)
@@ -305,14 +440,34 @@ def retry_tags(asset_id: str, db: SessionDep, user: UserDep):
         raise HTTPException(404, "Asset not found")
     if user.role == "agency":
         raise HTTPException(403, "Agency users have read-only access")
-    if asset.type != "video" or asset.analysis_state != "complete" or not asset.tag_error or not asset.transcript:
-        raise HTTPException(409, "Video tags are not ready to retry")
+    if (asset.type != "video" or asset.analysis_state != "complete" or not asset.transcript
+            or (not asset.tag_error and asset.ai_tags and not asset.classification_error
+                and asset.video_category)):
+        raise HTTPException(409, "Video insights are not ready to retry")
     asset.tag_error = None
+    asset.classification_error = None
     asset.analysis_state = "preparing"
     asset.analysis_progress = None
     db.commit()
     db.refresh(asset)
-    return asset
+    return public_asset(asset, user)
+
+
+@app.post("/api/videos/classification/retry-failed")
+def retry_failed_video_classifications(db: SessionDep, user: UserDep):
+    if user.role == "agency":
+        raise HTTPException(403, "Agency users have read-only access")
+    queued = 0
+    for asset in db.scalars(select(Asset).where(Asset.type == "video", Asset.analysis_state == "complete",
+                                               Asset.classification_error.is_not(None))):
+        if not visible(asset, user) or not asset.transcript or asset.category_source == "manual":
+            continue
+        asset.analysis_state = "preparing"
+        asset.analysis_progress = None
+        asset.classification_error = None
+        queued += 1
+    db.commit()
+    return {"queued": queued}
 
 
 @app.post("/api/upload", response_model=AssetRead, status_code=201)
@@ -346,21 +501,26 @@ async def upload_asset(db: SessionDep, user: UserDep, file: UploadFile = File(..
             storage.save(stored_name, path, mime)
             if mime == "video/mp4":
                 storage.thumbnail(stored_name)
+            duration_seconds = probe_video_duration(path) if mime == "video/mp4" else None
             title = Path(file.filename or "Untitled").stem.replace("_", " ")[:160]
             asset = Asset(
                 id=asset_id, title=title, type="video" if mime.startswith("video/") else "image",
                 campaign="Unassigned", brand="Northstar", status="draft", rights=date(2027, 12, 31),
                 audience="internal", tags=[], ai_tags=[],
                 description="New upload awaiting metadata review.", owner_id=user.id, owner=user.name,
-                size=f"{size / 1_000_000:.1f} MB", uploaded=date.today().strftime("%d %b %Y"),
+                size=f"{size / 1_000_000:.1f} MB", size_bytes=size,
+                uploaded=date.today().strftime("%d %b %Y"),
+                duration=duration_label(duration_seconds) if duration_seconds is not None else None,
+                duration_seconds=duration_seconds,
                 art="upload", file_name=stored_name, mime_type=mime, analysis_state="queued",
                 transcript=[],
             )
             db.add(asset)
+            mark_search_pending(db, asset)
             log_activity(db, f"{title} uploaded", user)
             db.commit()
             db.refresh(asset)
-            return asset
+            return public_asset(asset, user)
         except Exception:
             storage.delete(stored_name)
             if mime == "video/mp4":
@@ -371,19 +531,25 @@ async def upload_asset(db: SessionDep, user: UserDep, file: UploadFile = File(..
 
 
 @app.get("/uploads/{asset_id}")
-def get_uploaded_asset(asset_id: str, db: SessionDep, download: bool = False,
+def get_uploaded_asset(asset_id: str, db: SessionDep, viewer: str | None = None,
+                       expires: int | None = None, signature: str | None = None, download: bool = False,
                        range_header: Annotated[str | None, Header(alias="Range")] = None):
+    viewer_id = verify_media_url(asset_id, "original", viewer, expires, signature)
+    user = db.get(User, viewer_id)
     asset = db.get(Asset, asset_id)
-    if not asset or not asset.file_name:
+    if not user or not user.active or not asset or not asset.file_name or not visible(asset, user):
         raise HTTPException(404, "File not found")
     filename = f"{asset.title}{Path(asset.file_name).suffix}" if download else None
     return storage.response(asset.file_name, asset.mime_type or "application/octet-stream", range_header, filename)
 
 
 @app.get("/thumbnails/{asset_id}")
-def get_video_thumbnail(asset_id: str, db: SessionDep):
+def get_video_thumbnail(asset_id: str, db: SessionDep, viewer: str | None = None,
+                        expires: int | None = None, signature: str | None = None):
+    viewer_id = verify_media_url(asset_id, "thumbnail", viewer, expires, signature)
+    user = db.get(User, viewer_id)
     asset = db.get(Asset, asset_id)
-    if not asset or asset.type != "video" or not asset.file_name:
+    if not user or not user.active or not asset or asset.type != "video" or not asset.file_name or not visible(asset, user):
         raise HTTPException(404, "Thumbnail not found")
     thumbnail = storage.thumbnail(asset.file_name)
     if thumbnail is None:

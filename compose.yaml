@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:0.8.6-pg17-trixie
     environment:
       POSTGRES_USER: atlas
       POSTGRES_PASSWORD: atlas

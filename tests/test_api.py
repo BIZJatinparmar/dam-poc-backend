@@ -138,8 +138,30 @@ def test_uploaded_file_and_metadata_survive_new_session(client):
         assert asset is not None
         assert asset.status == "draft"
         assert (upload_dir / asset.file_name).is_file()
-    assert http.get(f"/uploads/{asset_id}").status_code == 200
-    assert http.get(f"/uploads/{asset_id}", headers={"Range": "bytes=0-3"}).status_code == 206
+    media_url = created.json()["url"]
+    assert http.get(f"/uploads/{asset_id}").status_code == 403
+    assert http.get(media_url).status_code == 200
+    assert http.get(media_url, headers={"Range": "bytes=0-3"}).status_code == 206
+
+
+def test_media_link_rechecks_demo_visibility(client):
+    http, engine, _ = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("sample.png", b"\x89PNG\r\n\x1a\nexample", "image/png")})
+    asset_id = created.json()["id"]
+    assert http.get(created.json()["url"]).status_code == 200
+    assert http.get(created.json()["url"].replace("viewer=alex", "viewer=quinn")).status_code == 403
+    with Session(engine) as db:
+        asset = db.get(Asset, asset_id)
+        asset.audience = "external"
+        asset.status = "approved"
+        db.commit()
+    agency_url = http.get(f"/api/assets/{asset_id}", headers=as_user("quinn")).json()["url"]
+    assert http.get(agency_url).status_code == 200
+    with Session(engine) as db:
+        db.get(Asset, asset_id).status = "draft"
+        db.commit()
+    assert http.get(agency_url).status_code == 404
 
 
 def test_video_thumbnail_and_processed_upload_survive_starter_cleanup(client):
@@ -153,7 +175,9 @@ def test_video_thumbnail_and_processed_upload_survive_starter_cleanup(client):
                         files={"file": ("clip.mp4", source.read_bytes(), "video/mp4")})
     assert created.status_code == 201
     asset_id = created.json()["id"]
-    assert created.json()["thumbnail_url"] == f"/thumbnails/{asset_id}"
+    assert 0.9 <= created.json()["duration_seconds"] <= 1.1
+    assert created.json()["duration"] == "0:01"
+    assert created.json()["thumbnail_url"].startswith(f"/thumbnails/{asset_id}?")
     first = http.get(created.json()["thumbnail_url"])
     assert first.status_code == 200
     assert first.headers["content-type"].startswith("image/jpeg")
@@ -169,14 +193,19 @@ def test_video_thumbnail_and_processed_upload_survive_starter_cleanup(client):
         assert session.get(Asset, asset_id).analysis_state == "complete"
         assert session.get(Asset, "NS-001") is None
         assert session.query(Activity).count() == 1
-    assert http.get(f"/uploads/{asset_id}").status_code == 200
-    partial = http.get(f"/uploads/{asset_id}", headers={"Range": "bytes=0-3"})
+        uploaded.duration_seconds = None
+        uploaded.duration = None
+        session.commit()
+        app_module.backfill_video_durations(session)
+        assert 0.9 <= session.get(Asset, asset_id).duration_seconds <= 1.1
+    assert http.get(created.json()["url"]).status_code == 200
+    partial = http.get(created.json()["url"], headers={"Range": "bytes=0-3"})
     assert partial.status_code == 206
     assert len(partial.content) == 4
 
     thumbnail = (upload_dir / uploaded.file_name).with_suffix(".jpg")
     thumbnail.unlink()
-    assert http.get(f"/thumbnails/{asset_id}").content.startswith(b"\xff\xd8")
+    assert http.get(created.json()["thumbnail_url"]).content.startswith(b"\xff\xd8")
 
 
 class FakeAzure:
@@ -212,6 +241,10 @@ class FakeAzure:
         assert transcript[0]["text"] == "A bright blue ocean"
         return ["Ocean"]
 
+    def classify_transcript(self, transcript):
+        assert transcript[0]["text"] == "A bright blue ocean"
+        return "other", "other", "A bright blue ocean"
+
     def poll_video(self, job_url):
         assert job_url.endswith("job-1")
         self.poll_count += 1
@@ -246,6 +279,34 @@ def test_image_analysis_merges_tags_edited_during_processing(client):
     assert asset_id not in [item["id"] for item in http.get("/api/assets?q=sky", headers=as_user("alex")).json()]
 
 
+def test_generated_tags_can_be_corrected_and_new_tags_added(client):
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("photo.png", b"\x89PNG\r\n\x1a\nexample", "image/png")})
+    asset_id = created.json()["id"]
+    azure = FakeAzure("image")
+    run_analysis_step(engine, upload_dir, azure)
+    run_analysis_step(engine, upload_dir, azure)
+
+    corrected = http.patch(f"/api/assets/{asset_id}", headers=as_user("alex"), json={
+        "tag_additions": ["Shore", "Campaign"], "tag_removals": ["Coast"]})
+    assert corrected.status_code == 200
+    assert corrected.json()["tags"] == ["Sky", "Shore", "Campaign"]
+    assert corrected.json()["ai_tags"] == ["Coast", "Sky"]
+    assert asset_id not in [item["id"] for item in http.get("/api/assets?q=coast", headers=as_user("alex")).json()]
+    assert asset_id in [item["id"] for item in http.get("/api/assets?q=shore", headers=as_user("alex")).json()]
+    assert http.patch(f"/api/assets/{asset_id}", headers=as_user("quinn"),
+                      json={"tag_additions": ["Denied"]}).status_code == 404
+
+    full = http.patch(f"/api/assets/{asset_id}", headers=as_user("alex"),
+                      json={"tags": [f"Tag {index}" for index in range(20)]})
+    assert full.status_code == 200
+    rejected = http.patch(f"/api/assets/{asset_id}", headers=as_user("alex"),
+                          json={"tag_additions": ["Too many"]})
+    assert rejected.status_code == 422
+    assert len(http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()["tags"]) == 20
+
+
 def test_video_progress_transcript_correction_search_and_permissions(client):
     http, engine, upload_dir = client
     mp4 = b"\x00\x00\x00\x14ftypisomexample"
@@ -263,14 +324,111 @@ def test_video_progress_transcript_correction_search_and_permissions(client):
     finished = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
     assert finished["transcript"] == [{"id": 1, "start": "0:00:01.234", "end": "0:00:03.234", "text": "A bright blue ocean"}]
     assert finished["ai_tags"] == ["Ocean"]
+    assert finished["video_category"] == "other"
+    assert finished["classification_evidence"] == "A bright blue ocean"
+    assert finished["size_bytes"] == len(mp4)
     corrected = http.patch(f"/api/assets/{asset_id}/transcript/1", headers=as_user("alex"),
                            json={"text": "A calm blue sea"})
     assert corrected.status_code == 200
     assert corrected.json()["transcript"][0]["text"] == "A calm blue sea"
+    assert corrected.json()["analysis_state"] == "preparing"
     assert asset_id in [item["id"] for item in http.get("/api/assets?q=calm", headers=as_user("alex")).json()]
     assert asset_id not in [item["id"] for item in http.get("/api/assets?q=bright", headers=as_user("alex")).json()]
     assert http.patch(f"/api/assets/{asset_id}/transcript/1", headers=as_user("quinn"),
                       json={"text": "changed"}).status_code == 404
+
+
+def test_video_category_can_be_corrected_without_ai_overwriting_it(client):
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("clip.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+    azure = FakeAzure("video")
+    for _ in range(4):
+        run_analysis_step(engine, upload_dir, azure)
+    assert http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()["video_category"] == "other"
+    corrected = http.patch(f"/api/assets/{asset_id}", headers=as_user("alex"), json={
+        "video_category": "training", "video_format": "tutorial"})
+    assert corrected.status_code == 200
+    assert corrected.json()["category_source"] == "manual"
+    assert corrected.json()["classification_evidence"] is None
+    assert http.patch(f"/api/assets/{asset_id}", headers=as_user("alex"), json={
+        "video_category": "unknown"}).status_code == 422
+    with Session(engine) as db:
+        asset = db.get(Asset, asset_id)
+        asset.analysis_state = "preparing"
+        db.commit()
+    run_analysis_step(engine, upload_dir, FakeAzure("video"))
+    detail = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
+    assert (detail["video_category"], detail["video_format"]) == ("training", "tutorial")
+
+
+def test_existing_video_size_is_backfilled_from_storage(client):
+    http, engine, upload_dir = client
+    media = upload_dir / "old-video.mp4"
+    media.write_bytes(b"original video data")
+    from datetime import date
+
+    with Session(engine) as db:
+        db.add(Asset(id="old-video", title="Old video", type="video", campaign="Archive",
+                     brand="Northstar", status="draft", rights=date(2027, 12, 31),
+                     audience="internal", tags=[], ai_tags=[], description="Archive",
+                     owner_id="alex", owner="Alex Morgan", size="0.0 MB", uploaded="1 Jan 2026",
+                     art="upload", file_name=media.name, transcript=[]))
+        db.commit()
+    with Session(engine) as db:
+        app_module.backfill_video_sizes(db)
+    old = http.get("/api/assets/old-video", headers=as_user("alex")).json()
+    assert old["size_bytes"] == len(b"original video data")
+
+
+def test_video_classification_failure_keeps_tags_and_can_retry(client):
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("clip.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+
+    class FailClassification(FakeAzure):
+        def classify_transcript(self, transcript):
+            raise AnalysisFailure("private model error")
+
+    azure = FailClassification("video")
+    for _ in range(4):
+        run_analysis_step(engine, upload_dir, azure)
+    detail = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
+    assert detail["ai_tags"] == ["Ocean"]
+    assert detail["video_category"] is None
+    assert "Retry video insights" in detail["classification_error"]
+    assert "private model error" not in detail["classification_error"]
+    assert http.post(f"/api/assets/{asset_id}/tags/retry", headers=as_user("alex")).status_code == 200
+    run_analysis_step(engine, upload_dir, FakeAzure("video"))
+    assert http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()["video_category"] == "other"
+
+
+def test_bulk_retry_queues_only_failed_transcribed_videos(client):
+    http, engine, _ = client
+    from datetime import date
+
+    with Session(engine) as db:
+        for asset_id, transcript, source in [
+            ("failed-video", [{"id": 1, "start": "0:00:00.000", "end": "0:00:02.000", "text": "Product training"}], None),
+            ("silent-video", [], None),
+            ("manual-video", [{"id": 1, "start": "0:00:00.000", "end": "0:00:02.000", "text": "Product training"}], "manual"),
+        ]:
+            db.add(Asset(id=asset_id, title=asset_id, type="video", campaign="Test", brand="Northstar",
+                         status="draft", rights=date(2027, 12, 31), audience="internal", tags=[], ai_tags=[],
+                         description="Test", owner_id="alex", owner="Alex Morgan", size="1 MB",
+                         uploaded="1 Sep 2026", art="upload", transcript=transcript,
+                         analysis_state="complete", classification_error="Previous failure",
+                         category_source=source))
+        db.commit()
+    url = "/api/videos/classification/retry-failed"
+    assert http.post(url, headers=as_user("quinn")).status_code == 403
+    assert http.post(url, headers=as_user("alex")).json() == {"queued": 1}
+    with Session(engine) as db:
+        assert db.get(Asset, "failed-video").analysis_state == "preparing"
+        assert db.get(Asset, "silent-video").analysis_state == "complete"
+        assert db.get(Asset, "manual-video").analysis_state == "complete"
 
 
 def test_tag_failure_keeps_transcript_and_tag_retry_skips_speech(client):
@@ -305,6 +463,33 @@ def test_tag_failure_keeps_transcript_and_tag_retry_skips_speech(client):
     detail = http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()
     assert detail["tag_error"] is None
     assert detail["ai_tags"] == ["Ocean"]
+
+
+def test_complete_video_with_no_tags_can_retry_without_retranscribing(client):
+    http, engine, upload_dir = client
+    created = http.post("/api/upload", headers=as_user("alex"),
+                        files={"file": ("clip.mp4", b"\0\0\0\x14ftypisomexample", "video/mp4")})
+    asset_id = created.json()["id"]
+    azure = FakeAzure("video")
+    for _ in range(4):
+        run_analysis_step(engine, upload_dir, azure)
+    with Session(engine) as db:
+        asset = db.get(Asset, asset_id)
+        asset.tags = []
+        asset.ai_tags = []
+        asset.tag_error = None
+        db.commit()
+    assert http.post(f"/api/assets/{asset_id}/tags/retry", headers=as_user("alex")).json()["analysis_state"] == "preparing"
+
+    class TagsOnly(FakeAzure):
+        def submit_video(self, asset, audio_blob):
+            raise AssertionError("Speech must not run during tag retry")
+
+        def poll_video(self, job_url):
+            raise AssertionError("Speech must not run during tag retry")
+
+    run_analysis_step(engine, upload_dir, TagsOnly("video"))
+    assert http.get(f"/api/assets/{asset_id}", headers=as_user("alex")).json()["ai_tags"] == ["Ocean"]
 
 
 def test_video_without_audio_completes_without_speech(client):

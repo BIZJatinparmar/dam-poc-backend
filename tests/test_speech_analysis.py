@@ -157,12 +157,40 @@ def test_fallback_rejects_remote_job_urls():
         azure.poll_video("https://evil.test/speechtotext/transcriptions/job")
 
 
-def test_tag_grounding_requires_every_word_in_exact_spoken_evidence():
+def test_tag_grounding_requires_every_word_in_contiguous_spoken_evidence():
     source = "The beach was crowded, and AI helped plan the trip."
     assert grounded_tag({"name": "Crowded beach", "evidence": "beach was crowded"}, source)
     assert grounded_tag({"name": "AI", "evidence": "AI helped plan"}, source)
     assert not grounded_tag({"name": "Beach sunset", "evidence": "The beach was crowded"}, source)
     assert not grounded_tag({"name": "Beach", "evidence": "beach was empty"}, source)
+
+
+def test_foundry_tags_accept_speech_quote_with_punctuation_difference(monkeypatch):
+    def handler(_request):
+        return httpx.Response(200, json={"output_text": json.dumps({"tags": [
+            {"name": "Blue ocean", "evidence": "blue ocean"},
+            {"name": "Sunset", "evidence": "blue ocean"},
+        ]})})
+
+    original = analysis.httpx.Client
+    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    azure = AzureAnalysisClient()
+    azure.foundry_endpoint = "https://foundry.test"
+    azure.foundry_key = "test"
+    assert azure.tag_transcript([{"text": "A bright blue, ocean appears."}]) == ["Blue ocean"]
+
+
+def test_foundry_empty_grounded_tags_are_reported_as_failure(monkeypatch):
+    original = analysis.httpx.Client
+    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(
+            200, json={"output_text": json.dumps({"tags": []})})), **kwargs))
+    azure = AzureAnalysisClient()
+    azure.foundry_endpoint = "https://foundry.test"
+    azure.foundry_key = "test"
+    with pytest.raises(AnalysisFailure, match="no grounded transcript tags"):
+        azure.tag_transcript([{"text": "A bright blue ocean"}])
 
 
 def test_foundry_tags_require_exact_evidence_and_consolidate(monkeypatch):
@@ -215,6 +243,39 @@ def test_foundry_tagging_accepts_v1_base_url(monkeypatch):
     assert azure.tag_transcript([{"text": "Azure ML overview"}]) == ["Azure"]
     assert requests[0].url.path == "/openai/v1/responses"
     assert json.loads(requests[0].content)["model"] == "gpt-6-luna"
+
+
+def test_video_classification_uses_controlled_labels_and_transcript_segment(monkeypatch):
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["text"]["format"]["name"] == "video_classification"
+        assert "only the spoken transcript" in body["input"][0]["content"]
+        return httpx.Response(200, json={"output_text": json.dumps({
+            "category": "training", "format": "tutorial", "evidence_segment_id": 7,
+        })})
+
+    original = analysis.httpx.Client
+    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original(
+        transport=httpx.MockTransport(handler), **kwargs))
+    azure = AzureAnalysisClient()
+    azure.foundry_endpoint = "https://foundry.test"
+    azure.foundry_key = "test"
+    assert azure.classify_transcript([{"id": 7, "text": "First, connect the device to power."}]) == (
+        "training", "tutorial", "First, connect the device to power.")
+    assert azure.classify_transcript([]) is None
+
+
+def test_video_classification_rejects_unknown_transcript_segment(monkeypatch):
+    original = analysis.httpx.Client
+    monkeypatch.setattr(analysis.httpx, "Client", lambda **kwargs: original(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={
+            "output_text": json.dumps({"category": "event", "format": "presentation",
+                                       "evidence_segment_id": 99})})), **kwargs))
+    azure = AzureAnalysisClient()
+    azure.foundry_endpoint = "https://foundry.test"
+    azure.foundry_key = "test"
+    with pytest.raises(AnalysisFailure, match="ungrounded video classification"):
+        azure.classify_transcript([{"id": 7, "text": "Welcome to our company briefing."}])
 
 
 def test_video_without_audio_skips_encoding(tmp_path: Path, monkeypatch):

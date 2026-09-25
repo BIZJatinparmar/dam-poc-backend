@@ -24,6 +24,7 @@ class AssetStorage(Protocol):
     def save(self, name: str, source: Path, content_type: str) -> None: ...
     def delete(self, name: str) -> None: ...
     def exists(self, name: str) -> bool: ...
+    def size_bytes(self, name: str) -> int: ...
     def materialize(self, name: str) -> Iterator[Path]: ...
     def response(self, name: str, content_type: str, range_header: str | None = None,
                  download_name: str | None = None) -> Response: ...
@@ -59,6 +60,9 @@ class LocalStorage:
 
     def exists(self, name: str) -> bool:
         return self.path(name).is_file()
+
+    def size_bytes(self, name: str) -> int:
+        return self.path(name).stat().st_size
 
     @contextmanager
     def materialize(self, name: str) -> Iterator[Path]:
@@ -110,6 +114,9 @@ class BlobStorage:
 
     def exists(self, name: str) -> bool:
         return self.blob(name).exists()
+
+    def size_bytes(self, name: str) -> int:
+        return self.blob(name).get_blob_properties().size
 
     @contextmanager
     def materialize(self, name: str) -> Iterator[Path]:

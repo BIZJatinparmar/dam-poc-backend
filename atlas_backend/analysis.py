@@ -18,7 +18,9 @@ from sqlalchemy import Engine, case, select
 from sqlalchemy.orm import Session
 
 from .models import Asset
+from .discovery import mark_search_pending
 from .storage import AssetStorage, BlobStorage, LocalStorage
+from .video_taxonomy import VIDEO_CATEGORIES, VIDEO_FORMATS
 
 
 ACTIVE_STATES = {"queued", "sending", "indexing", "preparing"}
@@ -111,9 +113,12 @@ def grounded_tag(item: dict, source: str) -> bool:
         return False
     evidence = evidence.strip().casefold()
     tag_words = set(re.findall(r"\w+", name.casefold()))
-    evidence_words = set(re.findall(r"\w+", evidence))
-    return (len(evidence) >= 4 and evidence in source.casefold() and bool(tag_words)
-            and tag_words <= evidence_words)
+    evidence_tokens = re.findall(r"\w+", evidence)
+    source_tokens = re.findall(r"\w+", source.casefold())
+    # Speech and Foundry often punctuate the same spoken words differently.
+    exact_spoken_words = f" {' '.join(evidence_tokens)} " in f" {' '.join(source_tokens)} "
+    return (len(evidence) >= 4 and exact_spoken_words and bool(tag_words)
+            and tag_words <= set(evidence_tokens))
 
 
 def timestamp(ticks: int) -> str:
@@ -364,6 +369,8 @@ class AzureAnalysisClient:
         if current:
             chunks.append(" ".join(current))
         candidates = clean_tags([tag for chunk in chunks for tag in self._foundry_tags(chunk)], limit=200)
+        if not candidates:
+            raise AnalysisFailure("Foundry returned no grounded transcript tags")
         if len(candidates) <= 20:
             return candidates
         # The second pass only selects from already grounded candidates.
@@ -371,6 +378,67 @@ class AzureAnalysisClient:
         allowed = {tag.casefold(): tag for tag in candidates}
         return clean_tags([allowed[tag.casefold()] for tag in self._foundry_tags(source, candidates=True)
                            if tag.casefold() in allowed])
+
+    def classify_transcript(self, transcript: list[dict]) -> tuple[str, str, str] | None:
+        """Return a primary topic, format, and evidence from a cited transcript segment."""
+        segments = [(int(item["id"]), str(item["text"]).strip()) for item in transcript
+                    if item.get("text") and item.get("id") is not None]
+        if not segments:
+            return None
+        if not self.foundry_endpoint or not self.foundry_key:
+            raise AnalysisFailure("Foundry transcript classification is not configured")
+        # Sample across long recordings so the classification is not based on the opening alone.
+        budget = 18_000
+        chosen = segments if sum(len(text) + len(str(segment_id)) + 4 for segment_id, text in segments) <= budget else [
+            (segments[index][0], segments[index][1][:240])
+            for index in sorted({round(i * (len(segments) - 1) / 59) for i in range(60)})
+        ]
+        evidence_by_id = dict(chosen)
+        source = "\n".join(f"[{segment_id}] {text}" for segment_id, text in chosen)
+        schema = {"type": "object", "properties": {
+            "category": {"type": "string", "enum": list(VIDEO_CATEGORIES)},
+            "format": {"type": "string", "enum": list(VIDEO_FORMATS)},
+            "evidence_segment_id": {"type": "integer"},
+        }, "required": ["category", "format", "evidence_segment_id"], "additionalProperties": False}
+        instruction = (
+            "Classify only the spoken transcript. Choose one primary subject category and one content format. "
+            "Use 'other' when the transcript does not support a more specific label. "
+            "Category meanings: product=products or demos; campaign=marketing or promotions; "
+            "event=an event or conference; training=instruction or education; "
+            "customer_story=customer experience or case study; company_update=organizational news. "
+            "Format meanings: tutorial=steps or how-to; interview=questions and answers; "
+            "presentation=extended talk; testimonial=first-person endorsement; "
+            "announcement=news or launch. Cite one numbered transcript segment that supports the labels. "
+            "Return its number as evidence_segment_id. "
+            "Do not infer what is visible in the video."
+        )
+        endpoint = self.foundry_endpoint.rstrip("/")
+        responses_url = (f"{endpoint}/responses" if endpoint.endswith("/openai/v1")
+                         else f"{endpoint}/openai/v1/responses")
+        with httpx.Client(timeout=90, trust_env=True) as client:
+            response = client.post(responses_url, headers={"api-key": self.foundry_key}, json={
+                "model": self.foundry_deployment,
+                "input": [{"role": "system", "content": instruction}, {"role": "user", "content": source}],
+                "reasoning": {"effort": "none"}, "max_output_tokens": 300,
+                "text": {"format": {"type": "json_schema", "name": "video_classification",
+                                    "schema": schema, "strict": True}},
+            })
+            response.raise_for_status()
+            result = response.json()
+        output = result.get("output_text") or "".join(
+            part.get("text", "") for item in result.get("output", [])
+            for part in item.get("content", []) if part.get("type") == "output_text")
+        try:
+            parsed = json.loads(output)
+            category, format_name = parsed["category"], parsed["format"]
+            evidence_segment_id = parsed["evidence_segment_id"]
+            if category not in VIDEO_CATEGORIES or format_name not in VIDEO_FORMATS:
+                raise ValueError("Invalid classification")
+            if type(evidence_segment_id) is not int or evidence_segment_id not in evidence_by_id:
+                raise ValueError("Classification evidence segment is not in the transcript")
+            return category, format_name, evidence_by_id[evidence_segment_id][:300]
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise AnalysisFailure("Foundry returned an ungrounded video classification") from exc
 
     def submit_image(self, path: Path, mime_type: str) -> str:
         url = f"{self.cu_endpoint}/contentunderstanding/analyzers/{self.cu_analyzer}:analyzeBinary"
@@ -440,8 +508,13 @@ def run_analysis_step(engine: Engine, asset_storage: AssetStorage | Path, client
                             current.transcript = []
                             current.ai_tags = []
                             current.tag_error = None
+                            current.video_category = None
+                            current.video_format = None
+                            current.classification_evidence = None
+                            current.classification_error = None
                             current.analysis_state = "complete"
                             current.analysis_progress = 100
+                            mark_search_pending(db, current)
                             db.commit()
                         return True
                     with Session(engine) as db:
@@ -476,14 +549,36 @@ def run_analysis_step(engine: Engine, asset_storage: AssetStorage | Path, client
                                        type(exc).__name__)
                     tags = []
                     tag_error = "Transcript ready, but AI tags could not be generated. Retry tags."
+                classification = None
+                classification_error = None
+                if asset.category_source != "manual":
+                    try:
+                        classification = client.classify_transcript(asset.transcript)
+                    except Exception as exc:
+                        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+                        LOGGER.warning("Transcript classification failed; error_type=%s; status=%s",
+                                       type(exc).__name__, status or "unavailable")
+                        if status:
+                            classification_error = f"Classification service returned HTTP {status}. Retry video insights."
+                        elif isinstance(exc, httpx.RequestError):
+                            classification_error = "Classification service is unavailable. Retry video insights."
+                        else:
+                            classification_error = "Transcript ready, but classification failed. Retry video insights."
                 with Session(engine) as db, TAG_LOCK:
                     current = db.get(Asset, asset_id)
                     current.tags = merge_tags(current.tags, tags)
                     current.ai_tags = tags
                     current.tag_error = tag_error
+                    if current.category_source != "manual":
+                        current.video_category = classification[0] if classification else None
+                        current.video_format = classification[1] if classification else None
+                        current.classification_evidence = classification[2] if classification else None
+                        current.category_source = "ai" if classification else None
+                    current.classification_error = classification_error
                     current.analysis_state = "complete"
                     current.analysis_progress = 100
                     current.analysis_error = None
+                    mark_search_pending(db, current)
                     db.commit()
                 return True
             # Image results can be fetched again after a restart.
@@ -501,6 +596,7 @@ def run_analysis_step(engine: Engine, asset_storage: AssetStorage | Path, client
                     current.analysis_progress = None
                     current.speech_job_url = None
                     current.speech_audio_blob = None
+                    mark_search_pending(db, current)
                     db.commit()
                 try:
                     client.delete_audio(audio_blob)
@@ -525,6 +621,7 @@ def run_analysis_step(engine: Engine, asset_storage: AssetStorage | Path, client
                     current.analysis_state = "complete"
                     current.analysis_progress = 100
                     current.analysis_error = None
+                    mark_search_pending(db, current)
                     db.commit()
             else:
                 current.analysis_state = "indexing"

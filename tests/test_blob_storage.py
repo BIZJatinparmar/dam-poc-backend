@@ -31,7 +31,7 @@ def test_upload_and_ranged_read_use_private_blob(client, monkeypatch, tmp_path):
         assert partial.status_code == 206
         assert partial.content == whole.content[2:6]
         assert partial.headers["content-range"] == f"bytes 2-5/{len(whole.content)}"
-        assert http.get(f"{url}?download=1").headers["content-disposition"].startswith("attachment;")
+        assert http.get(f"{url}&download=1").headers["content-disposition"].startswith("attachment;")
         assert run_analysis_step(engine, app_module.storage, FakeAzure("image"))
         assert run_analysis_step(engine, app_module.storage, FakeAzure("image"))
         assert http.get(f"/api/assets/{created.json()['id']}", headers={"X-Demo-User": "alex"}).json()["analysis_state"] == "complete"

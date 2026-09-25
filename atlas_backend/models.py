@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Float, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy.types import UserDefinedType
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -10,6 +11,13 @@ from .database import Base
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class Vector1536(UserDefinedType):
+    cache_ok = True
+
+    def get_col_spec(self, **_kw) -> str:
+        return "vector(1536)"
 
 
 class User(Base):
@@ -41,8 +49,15 @@ class Asset(Base):
     owner_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
     owner: Mapped[str] = mapped_column(String(120), nullable=False)
     size: Mapped[str] = mapped_column(String(30), nullable=False)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     uploaded: Mapped[str] = mapped_column(String(30), nullable=False)
+    video_category: Mapped[str | None] = mapped_column(String(30))
+    video_format: Mapped[str | None] = mapped_column(String(30))
+    classification_evidence: Mapped[str | None] = mapped_column(Text)
+    classification_error: Mapped[str | None] = mapped_column(String(255))
+    category_source: Mapped[str | None] = mapped_column(String(10))
     duration: Mapped[str | None] = mapped_column(String(20))
+    duration_seconds: Mapped[float | None] = mapped_column(Float)
     art: Mapped[str] = mapped_column(String(30), nullable=False)
     file_name: Mapped[str | None] = mapped_column(String(255))
     mime_type: Mapped[str | None] = mapped_column(String(100))
@@ -76,3 +91,28 @@ class Activity(Base):
     @property
     def time(self) -> str:
         return self.created_at.strftime("%d %b %Y, %H:%M")
+
+
+class SearchState(Base):
+    __tablename__ = "search_states"
+
+    asset_id: Mapped[str] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), primary_key=True)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    indexed_hash: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class SearchChunk(Base):
+    __tablename__ = "search_chunks"
+    __table_args__ = (UniqueConstraint("asset_id", "chunk_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_id: Mapped[str] = mapped_column(ForeignKey("assets.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    start_seconds: Mapped[float | None] = mapped_column(Float)
+    end_seconds: Mapped[float | None] = mapped_column(Float)
+    embedding: Mapped[str] = mapped_column(Vector1536(), nullable=False)
