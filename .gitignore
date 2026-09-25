@@ -9,3 +9,4 @@ __pycache__/
 .tmp/
 pytest-cache-files-*/
 *.py[cod]
+Untitled-1.txt
