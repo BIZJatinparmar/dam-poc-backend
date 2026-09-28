@@ -57,7 +57,7 @@ Discovery search is available at `POST /api/discovery/search` with `{ "query": "
 
 ## Linux App Service deployment
 
-The active `.github/workflows/main_wa-digitalasset.yml` workflow deploys this Python app directly to `wa-digitalasset`. Its build job downloads a pinned Linux x86-64 FFmpeg release, verifies the published SHA-256 checksum, and includes `ffmpeg` and `ffprobe` in the deployment artifact. The app prefers those bundled executables on Linux and uses the tools on `PATH` for local development. See `vendor/ffmpeg/README.md` for the pinned release.
+The active `.github/workflows/main_wa-digitalasset.yml` workflow deploys this Python app directly to `wa-digitalasset`. Its build job downloads the Linux x86-64 FFmpeg 9.0 archive from the upstream `latest` release, verifies the published SHA-256 checksum, and includes `ffmpeg` and `ffprobe` in the deployment artifact. The app prefers those bundled executables on Linux and uses the tools on `PATH` for local development. See `vendor/ffmpeg/README.md` for the release source.
 
 Configure the Linux App Service for the Python 3.14 runtime and keep `SCM_DO_BUILD_DURING_DEPLOYMENT=true` so Oryx installs `requirements.txt`. Set the startup command to `sh start.sh`; that script runs migrations and launches Uvicorn. This workflow does not use the Dockerfile. After deployment, verify that a video upload gets a thumbnail and duration, and that a video with speech can extract audio without an FFmpeg executable error.
 

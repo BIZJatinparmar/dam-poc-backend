@@ -36,8 +36,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release=autobuild-2026-09-01-13-13
-          archive=ffmpeg-n9.0.1-11-ge47273f4d9-linux64-lgpl-9.0.tar.xz
+          release=latest
+          archive=ffmpeg-n9.0-latest-linux64-lgpl-9.0.tar.xz
           root=${archive%.tar.xz}
           url="https://github.com/BtbN/FFmpeg-Builds/releases/download/$release"
           curl --fail --location --retry 3 --output "$RUNNER_TEMP/$archive" "$url/$archive"
