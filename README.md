@@ -55,7 +55,11 @@ Migration `0003_semantic_discovery` installs the `vector` extension and index ta
 
 Discovery search is available at `POST /api/discovery/search` with `{ "query": "...", "media_type": "all|video|image", "status": "all|draft|in_review|approved|published" }`. `POST /api/discovery/chat` also accepts `message` and up to six recent `{role,content}` messages; history is kept by the browser session. Responses include asset summaries and cited match IDs with numeric video start/end seconds. After provisioning a missing embedding deployment, an admin can use **Retry all failed** on the Discovery page (or `POST /api/discovery/retry-failed`) to requeue the backfill. Media URLs expire after one hour and are rechecked against the current demo user's visibility; the demo user header still does not provide real authentication.
 
-See `DEPLOYMENT.md` for App Service preparation.
+## Linux App Service deployment
+
+The active `.github/workflows/main_wa-digitalasset.yml` workflow deploys this Python app directly to `wa-digitalasset`. Its build job downloads a pinned Linux x86-64 FFmpeg release, verifies the published SHA-256 checksum, and includes `ffmpeg` and `ffprobe` in the deployment artifact. The app prefers those bundled executables on Linux and uses the tools on `PATH` for local development. See `vendor/ffmpeg/README.md` for the pinned release.
+
+Configure the Linux App Service for the Python 3.14 runtime and keep `SCM_DO_BUILD_DURING_DEPLOYMENT=true` so Oryx installs `requirements.txt`. Set the startup command to `sh start.sh`; that script runs migrations and launches Uvicorn. This workflow does not use the Dockerfile. After deployment, verify that a video upload gets a thumbnail and duration, and that a video with speech can extract audio without an FFmpeg executable error.
 
 ## Video dashboard
 

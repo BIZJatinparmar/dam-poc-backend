@@ -3,6 +3,8 @@
 import subprocess
 from pathlib import Path
 
+from .media_tools import media_tool
+
 
 def ensure_video_thumbnail(video_path: Path) -> Path | None:
     thumbnail = video_path.with_suffix(".jpg")
@@ -15,7 +17,7 @@ def ensure_video_thumbnail(video_path: Path) -> Path | None:
     for seek in ("0.5", "0"):
         try:
             result = subprocess.run(
-                ["ffmpeg", "-loglevel", "error", "-y", "-ss", seek, "-i", str(video_path),
+                [media_tool("ffmpeg"), "-loglevel", "error", "-y", "-ss", seek, "-i", str(video_path),
                  "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3", str(thumbnail)],
                 capture_output=True, timeout=30, check=False,
             )

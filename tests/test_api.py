@@ -672,7 +672,7 @@ def test_audio_extraction_preserves_timeline_and_original(tmp_path, monkeypatch)
 
     def fake_run(command, **kwargs):
         commands.append(command)
-        if command[0] == "ffprobe":
+        if Path(command[0]).name == "ffprobe":
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"streams": [
                 {"codec_type": "video"}, {"codec_type": "audio"},
             ]}), stderr="")
@@ -681,6 +681,6 @@ def test_audio_extraction_preserves_timeline_and_original(tmp_path, monkeypatch)
 
     monkeypatch.setattr(analysis.subprocess, "run", fake_run)
     assert analysis.extract_audio(source, output)
-    assert [item[0] for item in commands] == ["ffprobe", "ffmpeg"]
+    assert [Path(item[0]).name for item in commands] == ["ffprobe", "ffmpeg"]
     assert "aresample=async=1:first_pts=0" in commands[1]
     assert source.read_bytes() == b"original-video-bytes"

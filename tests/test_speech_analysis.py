@@ -280,7 +280,7 @@ def test_video_classification_rejects_unknown_transcript_segment(monkeypatch):
 
 def test_video_without_audio_skips_encoding(tmp_path: Path, monkeypatch):
     def fake_run(command, **kwargs):
-        assert command[0] == "ffprobe"
+        assert Path(command[0]).name == "ffprobe"
         return analysis.subprocess.CompletedProcess(command, 0,
             stdout='{"streams":[{"codec_type":"video"}]}', stderr="")
 

@@ -1,5 +1,7 @@
 # Azure App Service deployment guide
 
+The current backend deployment is the direct Python App Service workflow in `.github/workflows/main_wa-digitalasset.yml`. It bundles Linux `ffmpeg` and `ffprobe` into the deployment artifact as described in `README.md`. The container image instructions below are an older deployment plan and are not used by that workflow.
+
 This guide prepares two independent container images for **two Linux App Services**. It does not deploy anything automatically. Use East US unless your subscription or existing Azure AI resources require another region. Substitute globally unique names for every `<...>` value.
 
 ## Resources and order

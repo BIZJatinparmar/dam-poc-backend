@@ -31,8 +31,29 @@ jobs:
           python -m venv antenv
           source antenv/bin/activate
           pip install -r requirements.txt
-                
-      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size. 
+
+      - name: Bundle Linux FFmpeg and FFprobe
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=autobuild-2026-09-01-13-13
+          archive=ffmpeg-n9.0.1-11-ge47273f4d9-linux64-lgpl-9.0.tar.xz
+          root=${archive%.tar.xz}
+          url="https://github.com/BtbN/FFmpeg-Builds/releases/download/$release"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/$archive" "$url/$archive"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/checksums.sha256" "$url/checksums.sha256"
+          (
+            cd "$RUNNER_TEMP"
+            awk -v archive="$archive" '$2 == archive { print; found = 1 } END { if (!found) exit 1 }' checksums.sha256 | sha256sum --check --strict -
+          )
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" "$root/bin/ffmpeg" "$root/bin/ffprobe"
+          mkdir -p vendor/ffmpeg/linux-x64
+          install -m 755 "$RUNNER_TEMP/$root/bin/ffmpeg" vendor/ffmpeg/linux-x64/ffmpeg
+          install -m 755 "$RUNNER_TEMP/$root/bin/ffprobe" vendor/ffmpeg/linux-x64/ffprobe
+          vendor/ffmpeg/linux-x64/ffmpeg -version
+          vendor/ffmpeg/linux-x64/ffprobe -version
+
+      # By default, when you enable GitHub CI/CD integration through the Azure portal, the platform automatically sets the SCM_DO_BUILD_DURING_DEPLOYMENT application setting to true. This triggers the use of Oryx, a build engine that handles application compilation and dependency installation (e.g., pip install) directly on the platform during deployment. Hence, we exclude the antenv virtual environment directory from the deployment artifact to reduce the payload size.
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
@@ -45,18 +66,18 @@ jobs:
       # If you prefer to disable the Oryx build process during deployment, follow these steps:
       # 1. Remove the SCM_DO_BUILD_DURING_DEPLOYMENT app setting from your Azure App Service Environment variables.
       # 2. Refer to sample workflows for alternative deployment strategies: https://github.com/Azure/actions-workflow-samples/tree/master/AppService
-      
+
 
   deploy:
     runs-on: ubuntu-latest
     needs: build
-    
+
     steps:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp

@@ -10,3 +10,4 @@ __pycache__/
 pytest-cache-files-*/
 *.py[cod]
 Untitled-1.txt
+vendor/ffmpeg/linux-x64/

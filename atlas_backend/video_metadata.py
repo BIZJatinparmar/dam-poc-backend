@@ -7,11 +7,13 @@ import math
 import subprocess
 from pathlib import Path
 
+from .media_tools import media_tool
+
 
 def probe_video_duration(path: Path) -> float | None:
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+            [media_tool("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
             capture_output=True, text=True, timeout=30, check=False,
         )
         seconds = float(json.loads(result.stdout).get("format", {}).get("duration", ""))

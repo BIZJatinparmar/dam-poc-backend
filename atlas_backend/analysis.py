@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy import Engine, case, select
 from sqlalchemy.orm import Session
 
+from .media_tools import media_tool
 from .models import Asset
 from .discovery import mark_search_pending
 from .storage import AssetStorage, BlobStorage, LocalStorage
@@ -162,7 +163,7 @@ def extract_audio(path: Path, output: Path) -> bool:
     """Return false for a silent video; keep leading timeline silence in extracted audio."""
     try:
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+            [media_tool("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type",
              "-of", "json", str(path)], capture_output=True, text=True, timeout=30,
         )
     except FileNotFoundError as exc:
@@ -179,7 +180,7 @@ def extract_audio(path: Path, output: Path) -> bool:
         return False
     try:
         result = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+            [media_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-i", str(path),
              "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000",
              "-af", "aresample=async=1:first_pts=0", "-c:a", "flac", str(output)],
             capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL,
